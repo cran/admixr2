@@ -12,8 +12,14 @@
 #'   for the IRMC estimator.
 #' @param kappa_method Kappa correction method for models with non-mu-referenced
 #'   struct thetas: `"exact"` (default, re-evaluates population prediction `f(theta, 0)`
-#'   via rxSolve at each inner step) or `"linearized"` (precomputes `J = df/d(theta)`
-#'   once per outer iteration, approximates kappa via linear expansion — zero rxSolve per inner step).
+#'   via rxSolve at each inner step), `"linearized"` (precomputes `J = df/d(theta)`
+#'   once per outer iteration using `f(theta, 0)` as baseline — zero rxSolve per inner step),
+#'   or `"linearized_gh"` (same linear approximation but baseline and Jacobian use
+#'   Gauss-Hermite quadrature `E_GH[f(theta, eta)]` instead of `f(theta, 0)` — more
+#'   accurate baseline at any IIV magnitude, still zero rxSolve per inner step).
+#' @param kappa_n_nodes Number of GH nodes per eta dimension for
+#'   `kappa_method = "linearized_gh"` (default 5). Total quadrature points =
+#'   `kappa_n_nodes^n_eta`. Ignored for other kappa methods.
 #' @param outer_iter Maximum inner optimiser iterations per phase.
 #' @param omega_expansion Inflate proposal Omega by this factor (>= 1).
 #' @param phases Numeric vector of box-constraint half-widths, one per phase.
@@ -89,7 +95,7 @@ adirmcControl <- function(
     n_sim           = 2500L,
     outer_iter      = 50L,
     sampling        = c("sobol", "halton", "torus", "lhs", "rnorm"),
-    algorithm       = "NLOPT_LN_BOBYQA",
+    algorithm       = NULL,
     maxeval         = 5000L,
     ftol_rel        = .Machine$double.eps,
     print           = 1L,
@@ -97,7 +103,8 @@ adirmcControl <- function(
     seed            = 12345L,
     cores           = 1L,
     grad            = c("analytical", "none", "fd"),
-    kappa_method    = c("exact", "linearized"),
+    kappa_method    = c("exact", "linearized", "linearized_gh"),
+    kappa_n_nodes   = 5L,
     grad_h          = 1e-4,
     cov_h           = 1e-3,
     cov_h_outer     = .Machine$double.eps^(1/5),
@@ -135,7 +142,6 @@ adirmcControl <- function(
   checkmate::assertList(studies)
   checkmate::assertIntegerish(n_sim,        lower = 1L,  len = 1)
   checkmate::assertIntegerish(outer_iter,   lower = 1L,  len = 1)
-  checkmate::assertString(algorithm)
   checkmate::assertIntegerish(maxeval,      lower = 1L,  len = 1)
   checkmate::assertNumeric(ftol_rel,        lower = 0,   len = 1)
   checkmate::assertIntegerish(print,        lower = 0L,  len = 1)
@@ -148,14 +154,17 @@ adirmcControl <- function(
   checkmate::assertNumeric(phases,          lower = 0,   min.len = 1)
   checkmate::assertNumeric(convcrit,        lower = 0,   len = 1)
   checkmate::assertIntegerish(max_worse,    lower = 1L,  len = 1)
+  checkmate::assertIntegerish(kappa_n_nodes, lower = 1L, len = 1)
   covMethod <- match.arg(covMethod)
   checkmate::assertIntegerish(cov_n_sim,    lower = 1L,  len = 1)
   checkmate::assertIntegerish(n_restarts,   lower = 1L,  len = 1)
   checkmate::assertNumeric(restart_sd,      lower = 0,   len = 1)
   checkmate::assertIntegerish(workers,      lower = 1L,  len = 1)
 
-  if (grad != "none" && algorithm == "NLOPT_LN_BOBYQA")
-    algorithm <- "NLOPT_LD_LBFGS"
+  .algo     <- .admResolveAlgorithm(algorithm, grad,
+                                    .var.name = "adirmcControl: algorithm")
+  algorithm <- .algo$algorithm
+  grad      <- .algo$grad
 
   if (is.null(rxControl))   rxControl   <- rxode2::rxControl(sigdig = sigdig)
   if (is.null(sigdigTable)) sigdigTable <- max(round(sigdig), 3L)
@@ -174,6 +183,7 @@ adirmcControl <- function(
     cores           = as.integer(cores),
     grad            = grad,
     kappa_method    = kappa_method,
+    kappa_n_nodes   = as.integer(kappa_n_nodes),
     grad_h          = grad_h,
     cov_h           = cov_h,
     cov_h_outer     = cov_h_outer,
@@ -306,21 +316,21 @@ nmObjGetControl.adirmc <- function(x, ...) {
     mu  <- as.numeric(wmc$mu)
     V   <- wmc$V
 
-    mu_sim_irmc <- mu
+    mu_struct <- mu
     for (k in seq_along(pars$sigma_var))
       if (prop$sigma_type[k] == 2L)
         mu <- mu * exp(pars$sigma_var[k] / 2)
     for (k in seq_along(pars$sigma_var)) {
       sv <- pars$sigma_var[k]
       if (prop$sigma_type[k] == 1L)
-        diag(V) <- diag(V) + sv * mu_sim_irmc^2
+        diag(V) <- diag(V) + sv * mu_struct^2
       else if (prop$sigma_type[k] == 2L)
         diag(V) <- diag(V) + mu^2 * (exp(sv) - 1)
       else
         diag(V) <- diag(V) + sv
     }
 
-    mu_before_kappa <- mu
+    mu_sigma <- mu
     kappa_delta <- if (!is.null(prop$mu_pop))
       prop$kappa_fn(pars$struct) - prop$mu_pop
     else numeric(0)
@@ -346,19 +356,19 @@ nmObjGetControl.adirmc <- function(x, ...) {
       dNLL_dV_diag <- diag(dNLL_dV)
     }
 
-    # eff_dNLL_dmu folds in sigma V sensitivity w.r.t. mu_sim.
-    # prop:  dV_diag/dmu_sim = 2*sv*mu_sim -> +2*sv*mu_before_kappa*dNLL_dV_diag
+    # eff_dNLL_dmu folds in sigma V sensitivity w.r.t. mu_struct.
+    # prop:  dV_diag/dmu_struct = 2*sv*mu_struct -> +2*sv*mu_sigma*dNLL_dV_diag
     # lnorm: also scales residual path by exp(sv/2): +(exp(sv/2)-1)*dNLL_dmu
-    #        plus V path: +2*exp(sv/2)*mu_before_kappa*(exp(sv)-1)*dNLL_dV_diag
+    #        plus V path: +2*exp(sv/2)*mu_sigma*(exp(sv)-1)*dNLL_dV_diag
     eff_dNLL_dmu <- dNLL_dmu
     for (k in seq_along(pars$sigma_var)) {
       sv <- pars$sigma_var[k]
       if (prop$sigma_type[k] == 1L) {
-        eff_dNLL_dmu <- eff_dNLL_dmu + 2 * sv * mu_before_kappa * dNLL_dV_diag
+        eff_dNLL_dmu <- eff_dNLL_dmu + 2 * sv * mu_sigma * dNLL_dV_diag
       } else if (prop$sigma_type[k] == 2L) {
         eff_dNLL_dmu <- eff_dNLL_dmu +
           (exp(sv / 2) - 1) * dNLL_dmu +
-          2 * exp(sv / 2) * mu_before_kappa * (exp(sv) - 1) * dNLL_dV_diag
+          2 * exp(sv / 2) * mu_sigma * (exp(sv) - 1) * dNLL_dV_diag
       }
     }
 
@@ -504,6 +514,7 @@ nmObjGetControl.adirmc <- function(x, ...) {
                           study, z, output_var, params_df, cores,
                           eta_col_names, has_kappa = FALSE,
                           kappa_method = "exact",
+                          kappa_n_nodes = 5L,
                           struct_transforms = NULL, struct_eta_idx = NULL,
                           use_grad = TRUE) {
   Omega_prop <- omega * omega_expansion
@@ -535,6 +546,8 @@ nmObjGetControl.adirmc <- function(x, ...) {
   params_df_1        <- NULL
   h_jac              <- NULL
   n_s_single         <- 0L
+  n_gh               <- 1L
+  W_gh               <- 1.0
   struct0_opt_single <- NULL
   if (has_kappa && has_single_betas) {
     params_df_1 <- params_df[1L, , drop = FALSE]
@@ -550,6 +563,36 @@ nmObjGetControl.adirmc <- function(x, ...) {
         params_fd[j, single_beta_nms[j]] <- struct0_opt_single[j] + h_jac[j]
 
       params_df_ext <- rbind(params_df, params_df_1, params_fd)
+
+    } else if (kappa_method == "linearized_gh") {
+      n_s_single         <- length(single_beta_nms)
+      struct0_opt_single <- unlist(struct_theta)[single_beta_nms]
+      h_jac              <- rep(1e-4, n_s_single)
+
+      gh_grid <- .adghNodeGrid(kappa_n_nodes, n_eta_prop)
+      n_gh    <- length(gh_grid$W)
+      W_gh    <- gh_grid$W
+      L_base  <- tryCatch(t(chol(omega)), error = function(e) diag(max(1L, nrow(omega))))
+      eta_gh  <- if (n_eta_prop > 0L) gh_grid$X %*% t(L_base) else matrix(0, n_gh, 0L)
+
+      # Baseline: n_gh rows with GH eta, theta at current values
+      params_gh_base <- params_df[rep(1L, n_gh), , drop = FALSE]
+      for (nm in names(struct_theta)) params_gh_base[, nm] <- struct_theta[nm]
+      if (n_eta_prop > 0L) params_gh_base[, eta_col_names] <- eta_gh
+      for (nm in sigma_names) params_gh_base[, nm] <- 0
+
+      # FD rows: for each single_beta, n_gh rows with that param perturbed
+      params_gh_fd <- params_df[rep(1L, n_s_single * n_gh), , drop = FALSE]
+      for (j in seq_len(n_s_single)) {
+        row_ids <- (j - 1L) * n_gh + seq_len(n_gh)
+        for (nm in names(struct_theta)) params_gh_fd[row_ids, nm] <- struct_theta[nm]
+        params_gh_fd[row_ids, single_beta_nms[j]] <- struct0_opt_single[j] + h_jac[j]
+        if (n_eta_prop > 0L) params_gh_fd[row_ids, eta_col_names] <- eta_gh
+        for (nm in sigma_names) params_gh_fd[row_ids, nm] <- 0
+      }
+
+      params_df_ext <- rbind(params_df, params_gh_base, params_gh_fd)
+
     } else {
       params_df_ext <- rbind(params_df, params_df_1)
     }
@@ -572,7 +615,10 @@ nmObjGetControl.adirmc <- function(x, ...) {
 
   n_sim      <- nrow(z)
   n_times    <- length(study$times)
-  n_kappa_rows <- if (!has_kappa || !has_single_betas) 0L else if (kappa_method == "linearized") 1L + n_s_single else 1L
+  n_kappa_rows <- if (!has_kappa || !has_single_betas) 0L else
+    if (kappa_method == "linearized") 1L + n_s_single else
+    if (kappa_method == "linearized_gh") n_gh * (1L + n_s_single) else
+    1L
   n_expected   <- (n_sim + n_kappa_rows) * n_times
   if (length(obs_vals) != n_expected) {
     message(sprintf("adirmc: proposal:rxSolve returned %d values, expected %d",
@@ -588,7 +634,36 @@ nmObjGetControl.adirmc <- function(x, ...) {
   kappa_jac      <- NULL
   kappa_fn_batch <- NULL
   if (has_kappa && has_single_betas) {
-    mu_pop <- obs_vals[n_sim * n_times + seq_len(n_times)]
+
+    if (kappa_method == "linearized_gh") {
+      # GH-averaged baseline: mu_pop = sum_q W_q f(theta, eta_q)
+      gh_base_vals <- matrix(obs_vals[n_sim * n_times + seq_len(n_gh * n_times)],
+                             nrow = n_gh, ncol = n_times, byrow = TRUE)
+      mu_pop <- drop(crossprod(W_gh, gh_base_vals))
+
+      # GH-averaged FD Jacobian: each single_beta has n_gh rows in the batch
+      kappa_jac <- matrix(0, n_s_single, n_times)
+      for (j in seq_len(n_s_single)) {
+        fd_offset <- n_sim * n_times + n_gh * n_times + (j - 1L) * n_gh * n_times
+        fd_gh_j   <- matrix(obs_vals[fd_offset + seq_len(n_gh * n_times)],
+                             nrow = n_gh, ncol = n_times, byrow = TRUE)
+        kappa_jac[j, ] <- (drop(crossprod(W_gh, fd_gh_j)) - mu_pop) / h_jac[j]
+      }
+
+      kappa_fn <- local({
+        .kappa_jac <- kappa_jac
+        .mu_pop    <- mu_pop
+        .struct0   <- struct0_opt_single
+        .names     <- single_beta_nms
+        function(struct_cand) {
+          delta <- unlist(struct_cand)[.names] - .struct0
+          .mu_pop + drop(delta %*% .kappa_jac)
+        }
+      })
+
+    } else {
+      mu_pop <- obs_vals[n_sim * n_times + seq_len(n_times)]
+    }
 
     if (kappa_method == "linearized") {
       # Linearised kappa: vary single_betas only; J has n_s_single rows.
@@ -608,7 +683,7 @@ nmObjGetControl.adirmc <- function(x, ...) {
         }
       })
 
-    } else {
+    } else if (kappa_method != "linearized_gh") {
       # Exact kappa: re-evaluate f(theta_single, 0) per inner step; paired cols stay at orig.
       # Matches admr: beta_use <- origbeta; beta_use[single_betas] <- pnew[single_betas].
       kappa_fn <- local({
@@ -791,7 +866,11 @@ nmObjGetControl.adirmc <- function(x, ...) {
           }),
           NULL)
       }
-      algorithm_inner <- if (grad_mode == "none") algorithm else "NLOPT_LD_LBFGS"
+      # After .admResolveAlgorithm: grad_mode == "none" <=> derivative-free
+      # algorithm; grad_mode != "none" <=> gradient-based algorithm. Either way
+      # the user's chosen algorithm matches the available gradient, so honour it
+      # (the tryCatch below falls back to BOBYQA if the inner solve errors).
+      algorithm_inner <- algorithm
       lb_inner <- pmax(ov_lower, p_cur - ph_step)
       ub_inner <- pmin(ov_upper, p_cur + ph_step)
       opt <- tryCatch(
@@ -848,48 +927,28 @@ nmObjGetControl.adirmc <- function(x, ...) {
 # -- Restart worker ------------------------------------------------------------
 
 .adirmcRestartWorker <- function(restart_id, p_init, ui_lstExpr, pinfo,
-                               ov_lower, ov_upper, studies, n_sim, seed,
+                               ov_lower, ov_upper, scale_c = NULL, studies, n_sim, seed,
                                phases, outer_iter, maxeval, ftol_rel,
                                algorithm, omega_expansion, convcrit,
                                max_worse, grad_mode = "none",
+                               output_var = "cp",
                                kappa_method = "exact",
+                               kappa_n_nodes = 5L,
                                sampling = "sobol",
                                print_progress = TRUE, print = 1L,
                                cores = NULL, no_lock = FALSE,
                                rxMod_direct = NULL) {
   library(admixr2)
 
-  # Dev mode (load_all): furrr serializes updated functions into worker .GlobalEnv.
-  # Overwrite installed namespace so all downstream calls use the dev versions.
-  .adm_dev_nms <- ls(envir = .GlobalEnv, all.names = TRUE,
-                     pattern = "^\\.(adm|adfo|adirmc|softmax|logdmvnorm)")
-  if (length(.adm_dev_nms) > 0L) {
-    .adm_ns <- asNamespace("admixr2")
-    for (.adm_nm in .adm_dev_nms) {
-      .adm_fn <- get(.adm_nm, envir = .GlobalEnv, inherits = FALSE)
-      if (is.function(.adm_fn))
-        tryCatch(utils::assignInNamespace(.adm_nm, .adm_fn, ns = .adm_ns),
-                 error = function(e) NULL)
-    }
-    rm(.adm_dev_nms, .adm_ns, .adm_nm, .adm_fn)
-  }
+  # Dev mode (PSOCK workers): patch installed namespace with dev functions from
+  # .GlobalEnv (serialised there by furrr globals). tryCatch guards against
+  # the installed package predating this function (run devtools::install() once).
+  tryCatch(.admPatchDevNamespace(), error = function(e) NULL)
 
-  cores_w <- if (!is.null(cores)) {
-    cores
-  } else if (!is.null(rxMod_direct)) {
-    max(1L, parallel::detectCores() - 1L)
-  } else {
-    1L
-  }
-
-  if (!is.null(rxMod_direct)) {
-    rxMod <- rxMod_direct
-  } else {
-    .cacheFile <- file.path(rxode2::rxTempDir(),
-                            paste0("adm-sim-", digest::digest(ui_lstExpr), ".qs2"))
-    rxMod <- qs2::qs_read(.cacheFile)
-    rxode2::rxLoad(rxMod)
-  }
+  # adirmc has no sensitivity model (analytical inner gradient) -> no sens_* args.
+  m       <- .admWorkerLoadModels(ui_lstExpr, rxMod_direct, cores)
+  cores_w <- m$cores_w
+  rxMod   <- m$rxMod
 
   set.seed(seed)
   z_list      <- .admMakeZ(n_sim, pinfo, length(studies), sampling)
@@ -912,10 +971,11 @@ nmObjGetControl.adirmc <- function(x, ...) {
       .adirmcProposal(rxMod, pars$struct, pinfo$sigma_names,
                     pinfo$sigma_is_prop, pinfo$sigma_is_lnorm,
                     pars$omega, omega_expansion, studies[[si]],
-                    z_list[[si]], "cp", params_list[[si]], cores_w,
+                    z_list[[si]], output_var, params_list[[si]], cores_w,
                     pinfo$eta_col_names,
                     has_kappa         = pinfo$has_kappa,
                     kappa_method      = kappa_method,
+                    kappa_n_nodes     = kappa_n_nodes,
                     struct_transforms = pinfo$struct_transforms,
                     struct_eta_idx    = pinfo$struct_eta_idx,
                     use_grad          = grad_mode == "analytical"))
@@ -928,10 +988,11 @@ nmObjGetControl.adirmc <- function(x, ...) {
       .adirmcProposal(rxMod, pars$struct, pinfo$sigma_names,
                     pinfo$sigma_is_prop, pinfo$sigma_is_lnorm,
                     pars$omega, omega_expansion, studies[[si]],
-                    z_list[[si]], "cp", params_list[[si]], cores_w,
+                    z_list[[si]], output_var, params_list[[si]], cores_w,
                     pinfo$eta_col_names,
                     has_kappa         = pinfo$has_kappa,
                     kappa_method      = kappa_method,
+                    kappa_n_nodes     = kappa_n_nodes,
                     struct_transforms = pinfo$struct_transforms,
                     struct_eta_idx    = pinfo$struct_eta_idx,
                     use_grad          = FALSE))
@@ -1057,6 +1118,7 @@ nlmixr2Est.adirmc <- function(env, ...) {
                     params_list[[si]], cores, pinfo$eta_col_names,
                     has_kappa         = pinfo$has_kappa,
                     kappa_method      = .ctl$kappa_method,
+                    kappa_n_nodes     = .ctl$kappa_n_nodes,
                     struct_transforms = pinfo$struct_transforms,
                     struct_eta_idx    = pinfo$struct_eta_idx,
                     use_grad          = grad_mode_inner == "analytical"))
@@ -1073,6 +1135,7 @@ nlmixr2Est.adirmc <- function(env, ...) {
                     params_list[[si]], cores, pinfo$eta_col_names,
                     has_kappa         = pinfo$has_kappa,
                     kappa_method      = .ctl$kappa_method,
+                    kappa_n_nodes     = .ctl$kappa_n_nodes,
                     struct_transforms = pinfo$struct_transforms,
                     struct_eta_idx    = pinfo$struct_eta_idx,
                     use_grad          = FALSE))
@@ -1115,7 +1178,9 @@ nlmixr2Est.adirmc <- function(env, ...) {
         convcrit        = .ctl$convcrit,
         max_worse       = .ctl$max_worse,
         grad_mode       = grad_mode_inner,
+        output_var      = output_var,
         kappa_method    = .ctl$kappa_method,
+        kappa_n_nodes   = .ctl$kappa_n_nodes,
         sampling        = .ctl$sampling,
         print_progress  = .ctl$print > 0L,
         print           = .ctl$print,
@@ -1221,6 +1286,8 @@ nlmixr2Est.adirmc <- function(env, ...) {
   .fit$env$method    <- "adirmc"
   .fit$env$studies   <- studies
   .fit$env$adirmcExtra <- .ret$adirmcExtra
+  # Populate nlmixr2-style parameter history so traceplot(fit) works natively.
+  .admAttachParHist(.fit, .ret$adirmcExtra$all_traces, .ret$adirmcExtra$par_names, .ui)
   .old_cls <- class(.fit)
   .new_cls <- c("admFit", .old_cls)
   attr(.new_cls, ".foceiEnv") <- attr(.old_cls, ".foceiEnv")

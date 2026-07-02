@@ -49,14 +49,14 @@
   }
 }
 
-# Build V_pred and mu_eff (lnorm-corrected mean) for one study.
-# Returns list(V, mu_eff, JL): JL = J %*% L cached for gradient reuse.
+# Build V_pred and mu_sigma (lnorm-corrected mean) for one study.
+# Returns list(V, mu_sigma, JL): JL = J %*% L cached for gradient reuse.
 # V = tcrossprod(JL) + sigma contributions (additive, proportional, or lognormal).
 .adfoVpred <- function(mu_pred, J, L, sigma_var, sigma_is_prop, sigma_is_lnorm,
                         n_t, n_eta) {
-  mu_eff <- mu_pred
+  mu_sigma <- mu_pred
   for (i in seq_along(sigma_var))
-    if (sigma_is_lnorm[[i]]) mu_eff <- mu_eff * exp(sigma_var[[i]] / 2)
+    if (sigma_is_lnorm[[i]]) mu_sigma <- mu_sigma * exp(sigma_var[[i]] / 2)
 
   JL <- if (n_eta > 0L) J %*% L else matrix(0, n_t, 0)
   V  <- if (n_eta > 0L) tcrossprod(JL) else matrix(0, n_t, n_t)
@@ -66,13 +66,13 @@
     if (sigma_is_prop[[i]]) {
       d_V <- d_V + sv * mu_pred^2
     } else if (sigma_is_lnorm[[i]]) {
-      d_V <- d_V + mu_eff^2 * (exp(sv) - 1)
+      d_V <- d_V + mu_sigma^2 * (exp(sv) - 1)
     } else {
       d_V <- d_V + sv
     }
   }
   diag(V) <- d_V
-  list(V = V, mu_eff = mu_eff, JL = JL)
+  list(V = V, mu_sigma = mu_sigma, JL = JL)
 }
 
 # -- NLL -----------------------------------------------------------------------
@@ -94,9 +94,9 @@
                        pinfo$sigma_is_prop, pinfo$sigma_is_lnorm, n_t, pinfo$n_eta)
 
     nll_s <- if (s$method == "var") {
-      nll_var_cpp(s$E, s$v_diag, vp$mu_eff, diag(vp$V), s$n)
+      nll_var_cpp(s$E, s$v_diag, vp$mu_sigma, diag(vp$V), s$n)
     } else {
-      nll_cov_cpp(s$E, s$V, vp$mu_eff, vp$V, s$n)
+      nll_cov_cpp(s$E, s$V, vp$mu_sigma, vp$V, s$n)
     }
     if (!is.finite(nll_s)) return(Inf)
     total <- total + nll_s
@@ -147,9 +147,9 @@
                        pinfo$sigma_is_prop, pinfo$sigma_is_lnorm, n_t, n_eta)
 
     nll_s <- if (s$method == "var") {
-      nll_var_cpp(s$E, s$v_diag, vp$mu_eff, diag(vp$V), s$n)
+      nll_var_cpp(s$E, s$v_diag, vp$mu_sigma, diag(vp$V), s$n)
     } else {
-      nll_cov_cpp(s$E, s$V, vp$mu_eff, vp$V, s$n)
+      nll_cov_cpp(s$E, s$V, vp$mu_sigma, vp$V, s$n)
     }
     if (!is.finite(nll_s)) { nll_0 <- Inf; break }
     nll_0 <- nll_0 + nll_s
@@ -173,8 +173,8 @@
     if (is.null(mc)) next
     s      <- studies[[s_idx]]
     mu_pred <- mc$mu; J <- mc$J; vp <- mc$vp; n_t <- mc$n_t
-    V_pred  <- vp$V;  mu_eff <- vp$mu_eff
-    r       <- as.numeric(s$E) - mu_eff
+    V_pred  <- vp$V;  mu_sigma <- vp$mu_sigma
+    r       <- as.numeric(s$E) - mu_sigma
     is_var  <- identical(s$method, "var")
 
     if (is_var) {
@@ -193,7 +193,10 @@
 
     # Omega gradient: d(-2LL)/d(L[i,j]) via ML = t(J) dNLL_dV JL
     # (JL cached from Pass 1 -- avoids materialising M = t(J) dNLL_dV J separately)
-    # Diagonal p = 2*log(L_ii): chain rule gives (ML)[i,i] * L[i,i]
+    # Diagonal p = log(Omega_ii) = 2*log(L_ii):
+    #   d(NLL)/d(L_ii) = 2*(ML)[i,i]  (factor-of-2 from symmetric d(LL^T)/d(L_ii))
+    #   d(L_ii)/dp     = L_ii/2        (chain rule through L_ii = exp(p/2))
+    #   => d(NLL)/dp   = (ML)[i,i] * L_ii   (the two factors of 2 cancel)
     # Off-diagonal p = L_ij:    chain rule gives 2*(ML)[i,j]
     if (n_eta > 0L && n_o > 0L) {
       JL <- mc$JL
@@ -222,8 +225,8 @@
         dNLL_dmu     <- if (is_var) -2 * s$n * r / diag(V_pred) else
           drop(-2 * s$n * invV %*% r)
         grad[k_sig] <- grad[k_sig] + sv * (
-          sum(dNLL_dV_diag * mu_eff^2 * (2 * exp(sv) - 1)) +
-          sum(dNLL_dmu * mu_eff) / 2
+          sum(dNLL_dV_diag * mu_sigma^2 * (2 * exp(sv) - 1)) +
+          sum(dNLL_dmu * mu_sigma) / 2
         )
       } else {
         grad[k_sig] <- grad[k_sig] + sum(dNLL_dV_diag) * sv
@@ -276,6 +279,9 @@
   cov_idx <- seq_len(n_s + n_e)
   np_cov  <- length(cov_idx)
   nms_cov <- names(p_hat)[cov_idx]
+  message("  Note: covMethod='r' computes covariance for structural and sigma ",
+          "parameters only; omega (IIV) SEs are not computed (matching nlmixr2 ",
+          "FOCEI behavior).")
 
   nll_fn <- function(p)
     suppressMessages(.adfoNLL(p, pinfo, studies, sensModel, rxMod, output_var,
@@ -286,7 +292,8 @@
 
   nll0 <- nll_fn(p_hat)
   if (!is.finite(nll0)) {
-    warning("adfoCalcCov: NLL not finite at p_hat -- covariance not computed")
+    warning("adfoCalcCov: NLL not finite at p_hat -- covariance not computed",
+            call. = FALSE)
     return(NULL)
   }
 
@@ -323,6 +330,13 @@
     }
   }
 
+  if (!all(is.finite(H))) {
+    warning("adfoCalcCov: Hessian has non-finite entries -- covariance not computed",
+            call. = FALSE)
+    return(NULL)
+  }
+
+
   eig_dec <- tryCatch(eigen(H, symmetric = TRUE), error = function(e) NULL)
   H_eigs  <- if (!is.null(eig_dec)) eig_dec$values else rep(NA_real_, np_cov)
 
@@ -337,7 +351,8 @@
     chol2inv(chol(H)),
     error = function(e) tryCatch(solve(H), error = function(e2) NULL))
   if (is.null(Hinv)) {
-    warning("adfoCalcCov: Hessian inversion failed -- covariance not computed")
+    warning("adfoCalcCov: Hessian inversion failed -- covariance not computed",
+            call. = FALSE)
     return(NULL)
   }
 
@@ -356,6 +371,7 @@
                                 ov_lower, ov_upper, scale_c = NULL, studies, n_sim,
                                 seed, algorithm, ftol_rel, maxeval,
                                 use_grad, grad_h, grad_bounds,
+                                output_var = "cp",
                                 sampling = "sobol",
                                 use_central = FALSE,
                                 use_pure_fd = FALSE,
@@ -366,111 +382,34 @@
                                 rxMod_direct = NULL, sensModel_direct = NULL) {
   library(admixr2)
 
-  # Dev mode: patch installed namespace with updated functions from .GlobalEnv.
-  .adm_dev_nms <- ls(envir = .GlobalEnv, all.names = TRUE,
-                     pattern = "^\\.(adm|adfo|adirmc|softmax|logdmvnorm)")
-  if (length(.adm_dev_nms) > 0L) {
-    .adm_ns <- asNamespace("admixr2")
-    for (.adm_nm in .adm_dev_nms) {
-      .adm_fn <- get(.adm_nm, envir = .GlobalEnv, inherits = FALSE)
-      if (is.function(.adm_fn))
-        tryCatch(utils::assignInNamespace(.adm_nm, .adm_fn, ns = .adm_ns),
-                 error = function(e) NULL)
-    }
-    rm(.adm_dev_nms, .adm_ns, .adm_nm, .adm_fn)
-  }
+  # Dev mode (PSOCK workers): patch installed namespace with dev functions from
+  # .GlobalEnv (serialised there by furrr globals). tryCatch guards against
+  # the installed package predating this function (run devtools::install() once).
+  tryCatch(.admPatchDevNamespace(), error = function(e) NULL)
 
-  cores_w <- if (!is.null(cores)) {
-    cores
-  } else if (!is.null(rxMod_direct)) {
-    max(1L, parallel::detectCores() - 1L)
-  } else {
-    1L
-  }
-
-  if (!is.null(rxMod_direct)) {
-    rxMod <- rxMod_direct
-  } else {
-    .cacheFile <- file.path(rxode2::rxTempDir(),
-                            paste0("adm-sim-", digest::digest(ui_lstExpr), ".qs2"))
-    rxMod <- qs2::qs_read(.cacheFile)
-    rxode2::rxLoad(rxMod)
-  }
-
-  sensModel <- if (!is.null(sensModel_direct)) {
-    sensModel_direct
-  } else if (!is.null(sens_cache_file) && file.exists(sens_cache_file)) {
-    .smod <- tryCatch({ m <- qs2::qs_read(sens_cache_file); rxode2::rxLoad(m); m },
-                      error = function(e) NULL)
-    if (!is.null(.smod)) list(type = "ode", mod = .smod,
-                               sens_cols = sens_cols, rename_map = sens_rename)
-    else NULL
-  } else {
-    NULL
-  }
+  m <- .admWorkerLoadModels(ui_lstExpr, rxMod_direct, cores,
+                            sens_cache_file, sens_cols, sens_rename, sensModel_direct)
 
   params_list <- .admMakeParamsList(1L, pinfo, length(studies))
 
   set.seed(seed + restart_id)
-  output_var <- "cp"  # default; sensModel path uses rx_pred_ internally
 
-  .iter      <- 0L
-  .best_nll  <- Inf
-  .nll_trace <- numeric(0)
-  .par_trace <- NULL
+  nll_fn <- function(p)
+    .adfoNLL(p, pinfo, studies, m$sensModel, m$rxMod, output_var, params_list, m$cores_w)
 
-  eval_f <- function(p) {
-    .iter <<- .iter + 1L
-    val <- .adfoNLL(p, pinfo, studies, sensModel, rxMod, output_var, params_list, cores_w)
-    if (is.finite(val) && val < .best_nll) {
-      .best_nll  <<- val
-      .nll_trace <<- c(.nll_trace, val)
-      .par_trace <<- rbind(.par_trace, p)
-    }
-    if (print_progress && print > 0L && .iter %% print == 0L) {
-      row <- .admProgressRow(sprintf("%04d", .iter), val, p, pinfo)
-      if (!is.null(row)) message(row)
-    }
-    val
-  }
-
-  eval_grad_f <- if (!use_grad) {
-    NULL
-  } else if (use_pure_fd) {
-    function(p) .adfoFDGrad(p, pinfo, studies, sensModel, rxMod, output_var,
-                              params_list, cores_w, grad_h, use_central)
+  grad_fn <- if (use_pure_fd) {
+    function(p) .adfoFDGrad(p, pinfo, studies, m$sensModel, m$rxMod, output_var,
+                            params_list, m$cores_w, grad_h, use_central)
   } else {
-    function(p) .adfoGrad(p, pinfo, studies, sensModel, rxMod, output_var,
-                           params_list, cores_w, grad_h)
+    function(p) .adfoGrad(p, pinfo, studies, m$sensModel, m$rxMod, output_var,
+                          params_list, m$cores_w, grad_h)
   }
 
-  lb <- if (use_grad) pmax(ov_lower, p_init - grad_bounds) else ov_lower
-  ub <- if (use_grad) pmin(ov_upper, p_init + grad_bounds) else ov_upper
-
-  sc    <- if (!is.null(scale_c)) scale_c else rep(1.0, length(p_init))
-  p_sc  <- p_init / sc
-  lb_sc <- lb / sc; ub_sc <- ub / sc
-  eval_f_sc    <- function(p_s) eval_f(p_s * sc)
-  eval_grad_sc <- if (!is.null(eval_grad_f)) function(p_s) eval_grad_f(p_s * sc) * sc else NULL
-
-  t0 <- proc.time()
-  opt <- tryCatch(
-    nloptr::nloptr(
-      x0 = p_sc, eval_f = eval_f_sc,
-      eval_grad_f = eval_grad_sc,
-      lb = lb_sc, ub = ub_sc,
-      opts = list(algorithm = algorithm, ftol_rel = ftol_rel, maxeval = maxeval)
-    ),
-    error = function(e) list(objective = Inf, solution = p_init, message = conditionMessage(e))
-  )
-  list(restart_id = restart_id,
-       objective  = opt$objective,
-       solution   = if (!is.null(opt$solution)) opt$solution * sc else p_init,
-       n_iter     = .iter,
-       nll_trace  = .nll_trace,
-       par_trace  = .par_trace,
-       elapsed    = as.numeric((proc.time() - t0)["elapsed"]),
-       message    = opt$message)
+  # adfo loads its own model in-process and does not lock (single-nloptr path).
+  .admScaledOptimize(restart_id, p_init, ov_lower, ov_upper, scale_c,
+                     use_grad, grad_bounds, algorithm, ftol_rel, maxeval,
+                     nll_fn, grad_fn, pinfo, print_progress, print,
+                     lock_rxMod = NULL)
 }
 
 # -- Control object ------------------------------------------------------------
@@ -489,8 +428,14 @@
 #'   equations); `"fd"` uses forward finite differences of the full NLL;
 #'   `"cfd"` uses central finite differences for struct theta gradient
 #'   (more accurate than `"fd"`, roughly twice as many NLL evaluations per step).
-#' @param algorithm nloptr algorithm.  Automatically coerced to
-#'   `"NLOPT_LD_LBFGS"` when `grad != "none"`.
+#' @param algorithm nloptr algorithm, or `NULL` (default) to pick the default
+#'   that matches `grad`: `"NLOPT_LD_LBFGS"` with a gradient, `"NLOPT_LN_BOBYQA"`
+#'   when `grad = "none"`. Any algorithm reported by
+#'   [nloptr::nloptr.print.options()] is accepted. An explicit algorithm is
+#'   reconciled with `grad`: when `grad = "none"` a gradient-based algorithm
+#'   (`NLOPT_LD_*` / `NLOPT_GD_*`) falls back to `"NLOPT_LN_BOBYQA"`; when a
+#'   gradient is requested a derivative-free algorithm (`NLOPT_LN_*` /
+#'   `NLOPT_GN_*`) turns the gradient off. Both emit a message.
 #' @param maxeval Maximum function evaluations (default 500).
 #' @param ftol_rel Relative tolerance (default `sqrt(.Machine$double.eps)`).
 #' @param print Print-frequency for live progress (0 = silent).
@@ -500,8 +445,9 @@
 #'   FD Jacobian.
 #' @param grad_bounds Box-constraint half-width when using gradients.
 #' @param cov_h_outer Outer step scale for NLL-FD Hessian.
-#' @param covMethod `"r"` computes covariance via numerical Hessian; `"none"`
-#'   skips it.
+#' @param covMethod `"r"` computes covariance via numerical Hessian for
+#'   structural and residual-error parameters only (omega/IIV SEs are not
+#'   computed, consistent with nlmixr2 FOCEI); `"none"` skips it.
 #' @param n_restarts Number of optimizer restarts (1 = no multi-start).
 #' @param restart_sd Standard deviation for random perturbations of initial
 #'   struct thetas at each restart (> 1).
@@ -577,7 +523,7 @@
 adfoControl <- function(
     studies    = list(),
     grad        = c("none", "analytical", "fd", "cfd"),
-    algorithm  = "NLOPT_LN_BOBYQA",
+    algorithm  = NULL,
     maxeval    = 500L,
     ftol_rel   = .Machine$double.eps^(1/2),
     print      = 10L,
@@ -614,7 +560,6 @@ adfoControl <- function(
   covMethod <- match.arg(covMethod)
 
   checkmate::assertList(studies)
-  checkmate::assertString(algorithm)
   checkmate::assertIntegerish(maxeval,    lower = 1L, len = 1)
   checkmate::assertNumeric(ftol_rel,      lower = 0,  len = 1)
   checkmate::assertIntegerish(print,      lower = 0L, len = 1)
@@ -631,8 +576,10 @@ adfoControl <- function(
   checkmate::assertIntegerish(sigdig,     lower = 1L, len = 1)
   checkmate::assertLogical(returnAdmr,                len = 1)
 
-  if (grad != "none" && algorithm == "NLOPT_LN_BOBYQA")
-    algorithm <- "NLOPT_LD_LBFGS"
+  .algo     <- .admResolveAlgorithm(algorithm, grad,
+                                    .var.name = "adfoControl: algorithm")
+  algorithm <- .algo$algorithm
+  grad      <- .algo$grad
 
   if (is.null(rxControl))   rxControl   <- rxode2::rxControl(sigdig = sigdig)
   if (is.null(sigdigTable)) sigdigTable <- max(round(sigdig), 3L)
@@ -856,6 +803,7 @@ nlmixr2Est.adfo <- function(env, ...) {
                         use_pure_fd     = use_pure_fd,
                         grad_h          = .ctl$grad_h,
                         grad_bounds     = .ctl$grad_bounds,
+                        output_var      = output_var,
                         print_progress  = TRUE,
                         print           = .ctl$print,
                         cores           = .ctl$cores,
@@ -950,6 +898,8 @@ nlmixr2Est.adfo <- function(env, ...) {
   .fit$env$method   <- "adfo"
   .fit$env$studies  <- studies
   .fit$env$admExtra <- .ret$admExtra
+  # Populate nlmixr2-style parameter history so traceplot(fit) works natively.
+  .admAttachParHist(.fit, .ret$admExtra$all_traces, .ret$admExtra$par_names, .ui)
   .old_cls <- class(.fit)
   .new_cls <- c("admFit", .old_cls)
   attr(.new_cls, ".foceiEnv") <- attr(.old_cls, ".foceiEnv")

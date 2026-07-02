@@ -9,7 +9,7 @@ adirmcControl(
   n_sim = 2500L,
   outer_iter = 50L,
   sampling = c("sobol", "halton", "torus", "lhs", "rnorm"),
-  algorithm = "NLOPT_LN_BOBYQA",
+  algorithm = NULL,
   maxeval = 5000L,
   ftol_rel = .Machine$double.eps,
   print = 1L,
@@ -17,7 +17,8 @@ adirmcControl(
   seed = 12345L,
   cores = 1L,
   grad = c("analytical", "none", "fd"),
-  kappa_method = c("exact", "linearized"),
+  kappa_method = c("exact", "linearized", "linearized_gh"),
+  kappa_n_nodes = 5L,
   grad_h = 1e-04,
   cov_h = 0.001,
   cov_h_outer = .Machine$double.eps^(1/5),
@@ -62,8 +63,15 @@ adirmcControl(
 \code{"halton"} (Halton), \code{"torus"} (Kronecker/torus), \code{"lhs"} (Latin hypercube),
 or \code{"rnorm"} (iid normal).}
 
-\item{algorithm}{nloptr algorithm string. Automatically switched to
-\code{"NLOPT_LD_LBFGS"} when \code{grad != "none"}.}
+\item{algorithm}{nloptr algorithm string, or \code{NULL} (default) to pick the
+default that matches \code{grad}: \code{"NLOPT_LD_LBFGS"} with a gradient,
+\code{"NLOPT_LN_BOBYQA"} when \code{grad = "none"}. Any algorithm reported by
+\code{\link[nloptr:nloptr.print.options]{nloptr::nloptr.print.options()}} is accepted (e.g. \code{"NLOPT_LD_MMA"},
+\code{"NLOPT_LN_NELDERMEAD"}). An explicit algorithm is reconciled with \code{grad}:
+when \code{grad = "none"} a gradient-based algorithm (\verb{NLOPT_LD_*} /
+\verb{NLOPT_GD_*}) falls back to \code{"NLOPT_LN_BOBYQA"}; when a gradient is
+requested a derivative-free algorithm (\verb{NLOPT_LN_*} / \verb{NLOPT_GN_*}) turns
+the gradient off. Both emit a message.}
 
 \item{maxeval}{Maximum number of optimizer function evaluations.}
 
@@ -84,8 +92,15 @@ for the IRMC estimator.}
 
 \item{kappa_method}{Kappa correction method for models with non-mu-referenced
 struct thetas: \code{"exact"} (default, re-evaluates population prediction \code{f(theta, 0)}
-via rxSolve at each inner step) or \code{"linearized"} (precomputes \code{J = df/d(theta)}
-once per outer iteration, approximates kappa via linear expansion — zero rxSolve per inner step).}
+via rxSolve at each inner step), \code{"linearized"} (precomputes \code{J = df/d(theta)}
+once per outer iteration using \code{f(theta, 0)} as baseline — zero rxSolve per inner step),
+or \code{"linearized_gh"} (same linear approximation but baseline and Jacobian use
+Gauss-Hermite quadrature \code{E_GH[f(theta, eta)]} instead of \code{f(theta, 0)} — more
+accurate baseline at any IIV magnitude, still zero rxSolve per inner step).}
+
+\item{kappa_n_nodes}{Number of GH nodes per eta dimension for
+\code{kappa_method = "linearized_gh"} (default 5). Total quadrature points =
+\code{kappa_n_nodes^n_eta}. Ignored for other kappa methods.}
 
 \item{grad_h}{Step size for finite-difference gradient evaluation during
 optimization (used by \code{grad = "fd"} or \code{"cfd"}). The default 1e-4 is near
@@ -116,7 +131,9 @@ Phases progressively tighten the search region.}
 
 \item{max_worse}{Stop a phase after this many consecutive worsening iterations.}
 
-\item{covMethod}{Covariance method: \code{"r"} (numerical Hessian) or \code{"none"}.}
+\item{covMethod}{Covariance method: \code{"r"} (numerical Hessian for structural
+and residual-error parameters only; omega/IIV SEs are not computed,
+consistent with nlmixr2 FOCEI) or \code{"none"}.}
 
 \item{cov_n_sim}{Number of MC samples for the covariance (Hessian) step.
 More samples reduce MC noise in NLL evaluations. The NLL-based Hessian
@@ -131,9 +148,12 @@ cancels and \code{cov_n_sim = 10000} (default) is sufficient for most models.}
 restart initialisation.}
 
 \item{workers}{Number of parallel workers for multi-restart. \code{1} (default)
-runs restarts sequentially. Values \verb{> 1} use a PSOCK cluster on Windows
-and fork workers on Unix/macOS. Workers are stopped automatically after
-the restart phase so all cores are available for the Hessian step.}
+runs restarts sequentially. Values \verb{> 1} use fork workers on Unix/macOS
+(outside RStudio) and a PSOCK cluster on Windows or inside RStudio.
+\strong{RStudio on Linux}: \code{future::supportsMulticore()} returns \code{FALSE} inside
+RStudio even on Linux, so PSOCK is used; fork is only active when running
+from a terminal. Workers are stopped automatically after the restart phase
+so all cores are available for the Hessian step.}
 
 \item{rxControl}{\code{rxode2::rxControl()} object. Created automatically when \code{NULL}.}
 

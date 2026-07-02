@@ -2,6 +2,8 @@
 
 <!-- badges: start -->
 [![R-CMD-check](https://github.com/LeidenPharmacology/admixr2/actions/workflows/R-CMD-check.yaml/badge.svg)](https://github.com/LeidenPharmacology/admixr2/actions/workflows/R-CMD-check.yaml)
+[![CRAN version](https://www.r-pkg.org/badges/version/admixr2)](https://cran.r-project.org/package=admixr2)
+[![CRAN downloads](https://cranlogs.r-pkg.org/badges/grand-total/admixr2)](https://cran.r-project.org/package=admixr2)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 [![Lifecycle: stable](https://img.shields.io/badge/lifecycle-stable-brightgreen.svg)](https://lifecycle.r-lib.org/articles/stages.html#stable)
 [![DOI](https://img.shields.io/badge/DOI-10.1007%2Fs10928--025--10011--w-blue)](https://doi.org/10.1007/s10928-025-10011-w)
@@ -12,12 +14,13 @@
 the observed mean vector **E** and covariance matrix **V** reported per clinical
 study — rather than requiring individual patient records. It integrates with the
 [nlmixr2](https://nlmixr2.org/) / [rxode2](https://cran.r-project.org/package=rxode2)
-ecosystem and provides three estimation backends:
+ecosystem and provides four estimation backends:
 
 | Estimator | `est =` | Control |
 |-----------|---------|---------|
 | First-Order | `"adfo"` | `adfoControl()` |
 | Monte Carlo | `"admc"` | `admControl()` |
+| Gauss-Hermite | `"adgh"` | `adghControl()` |
 | Iterative Reweighting MC | `"adirmc"` | `adirmcControl()` |
 
 ## Model-Based Meta-Analysis
@@ -61,11 +64,11 @@ required.
 ## Installation
 
 ```r
-# Install from GitHub using pak (recommended)
-pak::pak("LeidenPharmacology/admixr2")
+# From CRAN
+install.packages("admixr2")
 
-# Or with remotes
-remotes::install_github("LeidenPharmacology/admixr2")
+# Development version from GitHub
+pak::pak("LeidenPharmacology/admixr2")
 ```
 
 ## Quick start
@@ -136,7 +139,7 @@ plot(fit)
 | [Getting started](https://leidenpharmacology.github.io/admixr2/articles/admixr2.html) | Core workflow: data prep, model, fit, diagnostics |
 | [Diagnostic plots](https://leidenpharmacology.github.io/admixr2/articles/diagnostic-plots.html) | All four plot panels explained; IIV heatmap |
 | [Multiple studies](https://leidenpharmacology.github.io/admixr2/articles/multiple-studies.html) | Joint fitting across studies with different designs |
-| [Estimator comparison](https://leidenpharmacology.github.io/admixr2/articles/estimator-comparison.html) | adfo, admc and adirmc: mathematical foundations and when to use each |
+| [Estimator comparison](https://leidenpharmacology.github.io/admixr2/articles/estimator-comparison.html) | adfo, admc, adgh and adirmc: mathematical foundations and when to use each |
 | [Advanced usage](https://leidenpharmacology.github.io/admixr2/articles/advanced.html) | Gradient modes, parallel restarts, AIC/BIC model comparison |
 
 ## Citation

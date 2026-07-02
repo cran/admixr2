@@ -11,6 +11,28 @@
 #       paste0("sens_",  digest(ui$lstExpr))  -> sens model result (in-memory cache)
 .adm_pin_env <- new.env(parent = emptyenv())
 
+# Session-scoped cache for once-per-session warnings.
+# Keys are error-type strings; presence of a key means the warning was already emitted.
+.adm_warn_env <- new.env(parent = emptyenv())
+
+#' Clear the admixr2 model cache
+#'
+#' Removes all cached simulation and sensitivity models from both the
+#' session-level in-memory cache and the qs2 disk files written to
+#' `rxode2::rxTempDir()`. Call this in long-running sessions to free memory
+#' and disk space after fitting many distinct models.
+#'
+#' @return Invisibly returns the number of in-memory objects removed.
+#' @export
+admClearCache <- function() {
+  nms <- ls(envir = .adm_pin_env, all.names = TRUE)
+  rm(list = nms, envir = .adm_pin_env)
+  qs2_files <- list.files(rxode2::rxTempDir(),
+                          pattern = "^adm-.*\\.qs2$", full.names = TRUE)
+  unlink(qs2_files)
+  invisible(length(nms))
+}
+
 .onLoad <- function(libname, pkgname) {
   tryCatch(.register_adm(),  error = function(e)
     warning("admixr2: admc registration failed (", conditionMessage(e), ")", call. = FALSE))
@@ -18,6 +40,8 @@
     warning("admixr2: adirmc registration failed (", conditionMessage(e), ")", call. = FALSE))
   tryCatch(.register_adfo(), error = function(e)
     warning("admixr2: adfo registration failed (", conditionMessage(e), ")", call. = FALSE))
+  tryCatch(.register_adgh(), error = function(e)
+    warning("admixr2: adgh registration failed (", conditionMessage(e), ")", call. = FALSE))
   # Register knit_print methods into knitr's namespace (knitr is in Suggests).
   # If knitr loads after admixr2 the setHook fires and registers then.
   tryCatch(.register_knit_print(), error = function(e) NULL)
@@ -53,4 +77,12 @@
   registerS3method("getValidNlmixrCtl",       "adfo",        getValidNlmixrCtl.adfo,               envir = ns)
   registerS3method("nmObjGetControl",         "adfo",        nmObjGetControl.adfo,                 envir = ns)
   registerS3method("nmObjHandleControlObject","adfoControl", nmObjHandleControlObject.adfoControl, envir = ns)
+}
+
+.register_adgh <- function() {
+  ns <- asNamespace("nlmixr2est")
+  registerS3method("nlmixr2Est",              "adgh",        nlmixr2Est.adgh,                      envir = ns)
+  registerS3method("getValidNlmixrCtl",       "adgh",        getValidNlmixrCtl.adgh,               envir = ns)
+  registerS3method("nmObjGetControl",         "adgh",        nmObjGetControl.adgh,                 envir = ns)
+  registerS3method("nmObjHandleControlObject","adghControl", nmObjHandleControlObject.adghControl, envir = ns)
 }

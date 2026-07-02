@@ -35,11 +35,17 @@ one_cmt_fn <- function() {
 # eval-env is GC'd — which unloads the rxMod DLL and crashes later rxSolve calls.
 .int_cache        <- NULL
 .int_grad_cache   <- NULL
+.int_grad_lin_kappa_cache <- NULL
+.int_irmc_exact_kappa_cache <- NULL
 .int_lincmt_cache <- NULL
 .int_irmc_cache   <- NULL
 .int_plot_cache   <- NULL
 .int_cov_cache    <- NULL
-.int_adfo_cache   <- NULL
+.int_adfo_cache        <- NULL
+.int_adfo_kappa_cache  <- NULL
+.int_adfo_cov_cache    <- NULL
+.int_adgh_cache        <- NULL
+.int_pipeline_cache    <- NULL
 
 # ---- linCmt model (1-cmt, 2 etas) -------------------------------------------
 
@@ -55,6 +61,29 @@ one_cmt_lincmt_fn <- function() {
     cl <- exp(tcl + eta.cl)
     v  <- exp(tv  + eta.v)
     linCmt() ~ add(add.err)
+  })
+}
+
+# ---- Model: 1-cmt with 2 etas + 1 unpaired struct theta ----------------------
+
+one_cmt_kappa_fn <- function() {
+  ini({
+    tcl     <- log(5)  ; label("Log CL")
+    tv      <- log(20) ; label("Log V")
+    # Intentionally unpaired from any eta so IRMC takes the kappa path.
+    tsc     <- log(1)  ; label("Log scale")
+    add.err <- 0.1     ; label("Additive SD")
+    eta.cl  ~ 0.09
+    eta.v   ~ 0.04
+  })
+  model({
+    cl <- exp(tcl + eta.cl)
+    v  <- exp(tv  + eta.v)
+    # Neutral scale keeps the same analytic mean while exercising has_kappa=TRUE.
+    sc <- exp(tsc)
+    d/dt(central) <- -(cl / v) * central
+    cp <- sc * central / v
+    cp ~ add(add.err)
   })
 }
 
@@ -91,7 +120,6 @@ one_cmt_lincmt_fn <- function() {
   study$ev_full <- study$ev |> rxode2::et(study$times)
   studies <- list(s = study)
 
-  set.seed(seed)
   z_list      <- admixr2:::.admMakeZ(n_sim, pinfo, 1L, "sobol")
   params_list <- admixr2:::.admMakeParamsList(n_sim, pinfo, 1L)
   vec         <- admixr2:::.admBuildOptVec(pinfo)
@@ -107,6 +135,15 @@ one_cmt_lincmt_fn <- function() {
   g_ana_p0 <- admixr2:::.admGrad(p0, pinfo, studies, z_list, rxMod, output_var,
                                  params_list, cores = 1L, h = h_fd,
                                  sensModel = NULL, use_central = TRUE)
+
+  g_fd_p0 <- vapply(seq_along(p0), function(k) {
+    ph <- p0; ph[k] <- ph[k] + h_fd
+    pl <- p0; pl[k] <- pl[k] - h_fd
+    nh <- admixr2:::.admNLL(ph, pinfo, studies, z_list, rxMod, output_var, params_list, cores = 1L)
+    nl <- admixr2:::.admNLL(pl, pinfo, studies, z_list, rxMod, output_var, params_list, cores = 1L)
+    (nh - nl) / (2 * h_fd)
+  }, double(1))
+  names(g_fd_p0) <- names(p0)
 
   # ---- IRMC inner gradient ---------------------------------------------------
   pars0 <- admixr2:::.admUnpack(p0, pinfo)
@@ -149,11 +186,99 @@ one_cmt_lincmt_fn <- function() {
     params_list = params_list, vec = vec,
     output_var = output_var, times = times,
     E_true = E_true, n_sim = n_sim, seed = seed,
-    g_ana_p0 = g_ana_p0,
+    g_ana_p0 = g_ana_p0, g_fd_p0 = g_fd_p0,
     irmc_proposals = irmc_proposals, proposals_ok = proposals_ok,
     g_irmc_ana = g_irmc_ana, g_irmc_fd = g_irmc_fd
   )
   .int_grad_cache
+}
+
+# ---- IRMC linearized-kappa grad setup ----------------------------------------
+
+.int_irmc_kappa_setup_impl <- function(kappa_method, n_sim) {
+  skip_on_cran()
+  skip_if_not_installed("rxode2")
+
+  ui <- suppressMessages(tryCatch(
+    rxode2::rxode2(one_cmt_kappa_fn),
+    error = function(e) NULL
+  ))
+  if (is.null(ui)) skip("rxode2 model parse failed")
+
+  pinfo      <- admixr2:::.admParseIniDf(ui$iniDf, ui)
+  output_var <- "cp"
+
+  rxMod <- tryCatch(admixr2:::.admLoadModel(ui), error = function(e) NULL)
+  if (is.null(rxMod)) skip("Model compilation failed")
+
+  times  <- c(0.5, 1, 2, 4)
+  E_true <- .one_cmt_mean(5, 20, 100, times)
+  V_true <- diag((0.3 * E_true)^2)
+
+  study <- list(E = E_true, V = V_true, n = 200L, times = times,
+                ev = rxode2::et(amt = 100))
+  study <- admixr2:::.admNormaliseStudy(study, "s")
+  study$ev_full <- study$ev |> rxode2::et(study$times)
+  studies <- list(s = study)
+
+  z_list      <- admixr2:::.admMakeZ(n_sim, pinfo, 1L, "sobol")
+  params_list <- admixr2:::.admMakeParamsList(n_sim, pinfo, 1L)
+  vec         <- admixr2:::.admBuildOptVec(pinfo)
+
+  p0    <- vec$p0
+  pars0 <- admixr2:::.admUnpack(p0, pinfo)
+  irmc_proposals <- lapply(seq_along(studies), function(si)
+    admixr2:::.adirmcProposal(
+      rxMod, pars0$struct, pinfo$sigma_names,
+      pinfo$sigma_is_prop, pinfo$sigma_is_lnorm,
+      pars0$omega, omega_expansion = 2,
+      studies[[si]], z_list[[si]], output_var,
+      params_list[[si]], cores = 1L,
+      pinfo$eta_col_names,
+      has_kappa         = pinfo$has_kappa,
+      kappa_method      = kappa_method,
+      struct_transforms = pinfo$struct_transforms,
+      struct_eta_idx    = pinfo$struct_eta_idx,
+      use_grad          = TRUE
+    )
+  )
+  proposals_ok <- !any(vapply(irmc_proposals, is.null, logical(1)))
+
+  g_irmc_ana <- NULL
+  g_irmc_fd  <- NULL
+  if (proposals_ok) {
+    g_irmc_ana <- admixr2:::.adirmcInnerGrad(p0, pinfo, studies, irmc_proposals)
+    names(g_irmc_ana) <- names(p0)
+
+    h_irmc <- 1e-4
+    g_irmc_fd <- vapply(seq_along(p0), function(k) {
+      ph <- p0; ph[k] <- ph[k] + h_irmc
+      pl <- p0; pl[k] <- pl[k] - h_irmc
+      nh <- admixr2:::.adirmcNLL(ph, pinfo, studies, irmc_proposals)
+      nl <- admixr2:::.adirmcNLL(pl, pinfo, studies, irmc_proposals)
+      (nh - nl) / (2 * h_irmc)
+    }, double(1))
+    names(g_irmc_fd) <- names(p0)
+  }
+
+  list(
+    ui = ui, pinfo = pinfo, rxMod = rxMod,
+    studies = studies, z_list = z_list,
+    params_list = params_list, vec = vec,
+    output_var = output_var, times = times,
+    E_true = E_true, n_sim = n_sim,
+    irmc_proposals = irmc_proposals, proposals_ok = proposals_ok,
+    g_irmc_ana = g_irmc_ana, g_irmc_fd = g_irmc_fd
+  )
+}
+
+.int_grad_lin_kappa_setup <- function(n_sim = 500L) {
+  skip_on_cran()
+  if (!is.null(.int_grad_lin_kappa_cache) &&
+      .int_grad_lin_kappa_cache$n_sim == n_sim)
+    return(.int_grad_lin_kappa_cache)
+  .int_grad_lin_kappa_cache <<- .int_irmc_kappa_setup_impl("linearized", n_sim)
+  .int_grad_lin_kappa_cache
 }
 
 # ---- linCmt setup ------------------------------------------------------------
@@ -188,7 +313,6 @@ one_cmt_lincmt_fn <- function() {
   study$ev_full <- study$ev |> rxode2::et(study$times)
   studies <- list(s = study)
 
-  set.seed(seed)
   z_list      <- admixr2:::.admMakeZ(n_sim, pinfo, 1L, "sobol")
   params_list <- admixr2:::.admMakeParamsList(n_sim, pinfo, 1L)
   vec         <- admixr2:::.admBuildOptVec(pinfo)
@@ -242,7 +366,6 @@ one_cmt_lincmt_fn <- function() {
   s$ev_full <- s$ev |> rxode2::et(s$times)
   studies <- list(s = s)
 
-  set.seed(seed)
   z_list      <- admixr2:::.admMakeZ(n_sim, pinfo, 1L, "sobol")
   params_list <- admixr2:::.admMakeParamsList(n_sim, pinfo, 1L)
   vec         <- admixr2:::.admBuildOptVec(pinfo)
@@ -325,7 +448,10 @@ one_cmt_lincmt_fn <- function() {
 }
 
 # ---- Covariance setup --------------------------------------------------------
-# Uses cov_n_sim = 5000L so the NLL surface is smooth enough for a PD Hessian.
+# Uses 5000 Sobol points pre-built here (not inside .admCalcCov()) so the draw
+# happens at a fixed position in the Sobol sequence. Passes z_cov directly with
+# cov_n_sim = NULL to skip internal regeneration which would draw at an
+# unpredictable sequence position mid-computation.
 # Cached once per session — avoids 5x repeated expensive computation in tests.
 
 .int_cov_setup <- function() {
@@ -344,16 +470,24 @@ one_cmt_lincmt_fn <- function() {
   p_cov   <- env$vec$p0
   p_cov[n_s + seq_len(n_e)] <- 0  # 2*log(sigma_sd) = 0 → sigma_sd = 1
 
+  # Build a 5000-point Sobol z_list here, outside .admCalcCov(), so the draw
+  # happens at a fixed position in the Sobol sequence (always right after
+  # .int_grad_setup()'s 500-point draw). Passing z_cov directly with
+  # cov_n_sim = NULL avoids the internal regeneration inside .admCalcCov()
+  # which would draw at an unpredictable sequence position.
+  z_cov      <- admixr2:::.admMakeZ(5000L, pinfo, 1L, "sobol")
+  params_cov <- admixr2:::.admMakeParamsList(5000L, pinfo, 1L)
+
   result_nll <- suppressWarnings(admixr2:::.admCalcCov(
-    p_cov, pinfo, env$studies, env$z_list,
-    env$rxMod, env$output_var, env$params_list, 1L,
-    cov_n_sim = 5000L, use_grad = FALSE
+    p_cov, pinfo, env$studies, z_cov,
+    env$rxMod, env$output_var, params_cov, 1L,
+    cov_n_sim = NULL, use_grad = FALSE
   ))
 
   result_grad <- suppressWarnings(admixr2:::.admCalcCov(
-    p_cov, pinfo, env$studies, env$z_list,
-    env$rxMod, env$output_var, env$params_list, 1L,
-    cov_n_sim = 5000L, use_grad = TRUE, sensModel = NULL
+    p_cov, pinfo, env$studies, z_cov,
+    env$rxMod, env$output_var, params_cov, 1L,
+    cov_n_sim = NULL, use_grad = TRUE, sensModel = NULL
   ))
 
   .int_cov_cache <<- list(
@@ -362,7 +496,390 @@ one_cmt_lincmt_fn <- function() {
     n_struct    = n_s,
     struct_names = pinfo$struct_names,
     result_nll  = result_nll,
-    result_grad = result_grad
+    result_grad = result_grad,
+    z_cov       = z_cov,
+    params_cov  = params_cov
   )
   .int_cov_cache
+}
+
+# ---- FO setup ----------------------------------------------------------------
+# Reuses sens+rxMod from .int_grad_setup() (ordering invariant satisfied).
+# Kept in helper so it is visible to test-integration-cov.R as well.
+
+.int_adfo_setup <- function() {
+  if (!is.null(.int_adfo_cache)) return(.int_adfo_cache)
+
+  skip_on_cran()
+  skip_if_not_installed("rxode2")
+
+  env <- .int_grad_setup()
+  if (is.null(env$rxMod)) skip("rxMod unavailable from grad setup")
+
+  pinfo      <- env$pinfo
+  studies    <- env$studies
+  output_var <- env$output_var
+  p0         <- env$vec$p0
+
+  params_list <- admixr2:::.admMakeParamsList(1L, pinfo, length(studies))
+
+  nll_p0 <- admixr2:::.adfoNLL(p0, pinfo, studies, env$sensModel, env$rxMod,
+                                output_var, params_list, cores = 1L)
+
+  p_bad     <- p0; p_bad["tcl"] <- p_bad["tcl"] + 0.5
+  nll_p_bad <- admixr2:::.adfoNLL(p_bad, pinfo, studies, env$sensModel, env$rxMod,
+                                   output_var, params_list, cores = 1L)
+
+  h_fd  <- 1e-4
+  g_ana <- admixr2:::.adfoGrad(p0, pinfo, studies, env$sensModel, env$rxMod,
+                                output_var, params_list, cores = 1L, grad_h = h_fd)
+
+  g_fd <- vapply(seq_along(p0), function(k) {
+    ph <- p0; ph[k] <- ph[k] + h_fd
+    pl <- p0; pl[k] <- pl[k] - h_fd
+    nh <- admixr2:::.adfoNLL(ph, pinfo, studies, env$sensModel, env$rxMod,
+                              output_var, params_list, 1L)
+    nl <- admixr2:::.adfoNLL(pl, pinfo, studies, env$sensModel, env$rxMod,
+                              output_var, params_list, 1L)
+    (nh - nl) / (2 * h_fd)
+  }, double(1))
+  names(g_fd) <- names(p0)
+
+  .int_adfo_cache <<- list(
+    pinfo = pinfo, studies = studies,
+    rxMod = env$rxMod, sensModel = env$sensModel,
+    output_var = output_var, params_list = params_list,
+    p0 = p0, p_bad = p_bad,
+    nll_p0 = nll_p0, nll_p_bad = nll_p_bad,
+    g_ana = g_ana, g_fd = g_fd, h_fd = h_fd
+  )
+  .int_adfo_cache
+}
+
+# ---- FO kappa setup ----------------------------------------------------------
+# Exercises the unpaired-struct-theta gradient path in .adfoGrad().
+# tsc is intentionally not mu-referenced by any eta.
+
+.int_adfo_kappa_setup <- function() {
+  if (!is.null(.int_adfo_kappa_cache)) return(.int_adfo_kappa_cache)
+
+  skip_on_cran()
+  skip_if_not_installed("rxode2")
+
+  ui <- suppressMessages(tryCatch(
+    rxode2::rxode2(one_cmt_kappa_fn),
+    error = function(e) NULL
+  ))
+  if (is.null(ui)) skip("rxode2 model parse failed")
+
+  pinfo      <- admixr2:::.admParseIniDf(ui$iniDf, ui)
+  output_var <- "cp"
+
+  sensModel <- tryCatch(admixr2:::.admLoadSensModel(ui), error = function(e) NULL)
+  rxMod     <- tryCatch(admixr2:::.admLoadModel(ui),     error = function(e) NULL)
+  if (is.null(rxMod))     skip("Model compilation failed")
+  if (is.null(sensModel)) skip("Sensitivity model unavailable")
+
+  times  <- c(0.5, 1, 2, 4)
+  E_true <- .one_cmt_mean(5, 20, 100, times)
+  V_true <- diag((0.3 * E_true)^2)
+
+  study <- list(E = E_true, V = V_true, n = 200L, times = times,
+                ev = rxode2::et(amt = 100))
+  study <- admixr2:::.admNormaliseStudy(study, "s")
+  study$ev_full <- study$ev |> rxode2::et(study$times)
+  studies <- list(s = study)
+
+  params_list <- admixr2:::.admMakeParamsList(1L, pinfo, length(studies))
+  p0          <- admixr2:::.admBuildOptVec(pinfo)$p0
+  h_fd        <- 1e-4
+
+  g_ana <- admixr2:::.adfoGrad(p0, pinfo, studies, sensModel, rxMod,
+                               output_var, params_list, cores = 1L, grad_h = h_fd)
+
+  # Central FD reference using the same scaled step as .adfoGrad() so that
+  # the perturbation matches for each parameter (pmax(|p[k]|, 0.1) * h_fd).
+  g_fd <- vapply(seq_along(p0), function(k) {
+    hk <- pmax(abs(p0[k]), 0.1) * h_fd
+    ph <- p0; ph[k] <- ph[k] + hk
+    pl <- p0; pl[k] <- pl[k] - hk
+    nh <- admixr2:::.adfoNLL(ph, pinfo, studies, sensModel, rxMod,
+                              output_var, params_list, 1L)
+    nl <- admixr2:::.adfoNLL(pl, pinfo, studies, sensModel, rxMod,
+                              output_var, params_list, 1L)
+    (nh - nl) / (2 * hk)
+  }, double(1))
+  names(g_fd) <- names(p0)
+
+  .int_adfo_kappa_cache <<- list(
+    pinfo = pinfo, studies = studies,
+    rxMod = rxMod, sensModel = sensModel,
+    output_var = output_var, params_list = params_list,
+    p0 = p0, g_ana = g_ana, g_fd = g_fd, h_fd = h_fd
+  )
+  .int_adfo_kappa_cache
+}
+
+# ---- FO covariance setup -----------------------------------------------------
+# Mirrors .int_cov_setup() but calls .adfoCalcCov() instead of .admCalcCov().
+# Shifts sigma to sd=1 (log_sigma_var=0) so the Hessian is well-conditioned.
+
+.int_adfo_cov_setup <- function() {
+  if (!is.null(.int_adfo_cov_cache)) return(.int_adfo_cov_cache)
+
+  env <- .int_adfo_setup()   # handles skip guards internally
+
+  pinfo <- env$pinfo
+  n_s   <- length(pinfo$struct_names)
+  n_e   <- length(pinfo$sigma_names)
+  p_cov <- env$p0
+  p_cov[n_s + seq_len(n_e)] <- 0  # 2*log(sigma_sd) = 0 → sigma_sd = 1
+
+  result_nll <- suppressWarnings(admixr2:::.adfoCalcCov(
+    p_cov, pinfo, env$studies, env$sensModel, env$rxMod, env$output_var,
+    env$params_list, 1L,
+    use_grad = FALSE
+  ))
+
+  result_grad <- suppressWarnings(admixr2:::.adfoCalcCov(
+    p_cov, pinfo, env$studies, env$sensModel, env$rxMod, env$output_var,
+    env$params_list, 1L,
+    use_grad = TRUE
+  ))
+
+  .int_adfo_cov_cache <<- list(
+    env          = env,
+    p_cov        = p_cov,
+    n_struct     = n_s,
+    struct_names = pinfo$struct_names,
+    result_nll   = result_nll,
+    result_grad  = result_grad
+  )
+  .int_adfo_cov_cache
+}
+
+# ---- IRMC exact-kappa gradient setup -----------------------------------------
+# Same as .int_grad_lin_kappa_setup() but kappa_method = "exact".
+# Uses one_cmt_kappa_fn so has_kappa = TRUE (tsc is unpaired).
+
+.int_irmc_exact_kappa_setup <- function(n_sim = 500L) {
+  skip_on_cran()
+  if (!is.null(.int_irmc_exact_kappa_cache) &&
+      .int_irmc_exact_kappa_cache$n_sim == n_sim)
+    return(.int_irmc_exact_kappa_cache)
+  .int_irmc_exact_kappa_cache <<- .int_irmc_kappa_setup_impl("exact", n_sim)
+  .int_irmc_exact_kappa_cache
+}
+
+# ---- adgh setup --------------------------------------------------------------
+# Uses one_cmt_fn (2 etas, additive error). Computes .adghMoments(), .adghNLL()
+# at truth and perturbed params, and .adghGrad() vs FD reference.
+# Sens model loaded before rxMod (ordering invariant).
+
+.int_adgh_setup <- function(n_nodes = 5L) {
+  if (!is.null(.int_adgh_cache) && .int_adgh_cache$n_nodes == n_nodes)
+    return(.int_adgh_cache)
+
+  skip_on_cran()
+  skip_if_not_installed("rxode2")
+
+  ui <- suppressMessages(tryCatch(
+    rxode2::rxode2(one_cmt_fn),
+    error = function(e) NULL
+  ))
+  if (is.null(ui)) skip("rxode2 model parse failed")
+
+  pinfo      <- admixr2:::.admParseIniDf(ui$iniDf, ui)
+  output_var <- "cp"
+
+  sensModel <- tryCatch(admixr2:::.admLoadSensModel(ui), error = function(e) NULL)
+  rxMod     <- tryCatch(admixr2:::.admLoadModel(ui),     error = function(e) NULL)
+  if (is.null(rxMod)) skip("Model compilation failed")
+
+  times  <- c(0.5, 1, 2, 4)
+  E_true <- .one_cmt_mean(5, 20, 100, times)
+  V_true <- diag((0.3 * E_true)^2)
+
+  study <- list(E = E_true, V = V_true, n = 200L, times = times,
+                ev = rxode2::et(amt = 100))
+  study <- admixr2:::.admNormaliseStudy(study, "s")
+  study$ev_full <- study$ev |> rxode2::et(study$times)
+  studies <- list(s = study)
+
+  vec  <- admixr2:::.admBuildOptVec(pinfo)
+  p0   <- vec$p0
+  pars <- admixr2:::.admUnpack(p0, pinfo)
+  grid <- admixr2:::.adghNodeGrid(n_nodes, pinfo$n_eta)
+
+  moments_p0 <- admixr2:::.adghMoments(pars, pinfo, study, rxMod, output_var,
+                                        grid, cores = 1L)
+
+  nll_p0  <- admixr2:::.adghNLL(p0, pinfo, studies, rxMod, output_var, grid, 1L)
+  p_bad   <- p0; p_bad["tcl"] <- p_bad["tcl"] + 0.5
+  nll_bad <- admixr2:::.adghNLL(p_bad, pinfo, studies, rxMod, output_var, grid, 1L)
+
+  h_fd  <- 1e-4
+  g_ana <- if (!is.null(sensModel))
+    admixr2:::.adghGrad(p0, pinfo, studies, sensModel, rxMod, output_var,
+                         grid, cores = 1L, grad_h = h_fd)
+  else NULL
+
+  g_fd <- vapply(seq_along(p0), function(k) {
+    hk <- pmax(abs(p0[k]), 0.1) * h_fd
+    ph <- p0; ph[k] <- ph[k] + hk
+    pl <- p0; pl[k] <- pl[k] - hk
+    nh <- admixr2:::.adghNLL(ph, pinfo, studies, rxMod, output_var, grid, 1L)
+    nl <- admixr2:::.adghNLL(pl, pinfo, studies, rxMod, output_var, grid, 1L)
+    (nh - nl) / (2 * hk)
+  }, double(1))
+  names(g_fd) <- names(p0)
+
+  .int_adgh_cache <<- list(
+    ui = ui, pinfo = pinfo, rxMod = rxMod, sensModel = sensModel,
+    studies = studies, study = study,
+    vec = vec, p0 = p0, pars = pars, grid = grid,
+    output_var = output_var, times = times,
+    E_true = E_true, n_nodes = n_nodes,
+    moments_p0 = moments_p0,
+    nll_p0 = nll_p0, nll_bad = nll_bad,
+    p_bad = p_bad,
+    g_ana = g_ana, g_fd = g_fd, h_fd = h_fd
+  )
+  .int_adgh_cache
+}
+
+# ---- End-to-end estimator pipeline setup -------------------------------------
+# Drives the full nlmixr2(model, admData(), est = ...) entry points for all
+# four estimators (nlmixr2Est.admc / .adfo / .adirmc / .adgh) plus the
+# multi-restart, multi-study and covMethod = "r" pipeline branches. Each fit
+# compiles/loads the same 1-cmt model (cached after the first build) and runs a
+# short optimisation -- the goal is to verify a valid admFit is returned with a
+# finite objective, not to check convergence. All fits are cached once per
+# session because each nlmixr2() call is expensive.
+#
+# Model init values equal the data-generating truth (tcl = log(5),
+# tv = log(20)), so a short fit stays near truth and "sensible estimate" checks
+# can use a loose band around the true values.
+
+.int_pipeline_setup <- function() {
+  if (!is.null(.int_pipeline_cache)) return(.int_pipeline_cache)
+
+  skip_on_cran()
+  skip_if_not_installed("rxode2")
+  skip_if_not_installed("nlmixr2est")
+
+  nlmixr2 <- nlmixr2est::nlmixr2
+
+  times  <- c(0.5, 1, 2, 4)
+  E_true <- .one_cmt_mean(5, 20, 100, times)
+  V_true <- diag((0.3 * E_true)^2)
+  study1 <- list(E = E_true, V = V_true, n = 200L, times = times,
+                 ev = rxode2::et(amt = 100))
+
+  # Second study at a different dose for the multi-study branch.
+  E2     <- .one_cmt_mean(5, 20, 200, times)
+  study2 <- list(E = E2, V = diag((0.3 * E2)^2), n = 150L, times = times,
+                 ev = rxode2::et(amt = 200))
+
+  run <- function(est, control)
+    suppressMessages(nlmixr2(one_cmt_fn, admData(), est = est, control = control))
+
+  fit_admc <- run("admc",
+    admControl(studies = list(s1 = study1), n_sim = 300L, maxeval = 15L,
+               seed = 1L, grad = "sens", covMethod = "none"))
+
+  fit_adfo <- run("adfo",
+    adfoControl(studies = list(s1 = study1), maxeval = 15L,
+                grad = "none", covMethod = "none"))
+
+  fit_adirmc <- run("adirmc",
+    adirmcControl(studies = list(s1 = study1), n_sim = 300L,
+                  phases = c(1, 0.5), outer_iter = 10L, seed = 1L,
+                  covMethod = "none"))
+
+  fit_adgh <- run("adgh",
+    adghControl(studies = list(s1 = study1), n_nodes = 5L, maxeval = 15L,
+                seed = 1L, grad = "none", covMethod = "none"))
+
+  fit_restart <- run("admc",
+    admControl(studies = list(s1 = study1), n_sim = 300L, maxeval = 12L,
+               seed = 1L, grad = "sens", covMethod = "none",
+               n_restarts = 2L, workers = 1L, restart_sd = 0.2))
+
+  fit_multistudy <- run("admc",
+    admControl(studies = list(s1 = study1, s2 = study2), n_sim = 300L,
+               maxeval = 12L, seed = 1L, grad = "sens", covMethod = "none"))
+
+  fit_cov <- run("admc",
+    admControl(studies = list(s1 = study1), n_sim = 300L, maxeval = 12L,
+               seed = 1L, grad = "sens", covMethod = "r", cov_n_sim = 2000L))
+
+  # --- Restart / covariance / multi-study branches for the non-MC estimators ---
+  # These exercise the per-estimator restart workers (.adghRestartWorker /
+  # .adfoRestartWorker / .adirmcRestartWorker via .admRunRestarts), the in-pipeline
+  # covariance branches (.adghCalcCov / .adfoCalcCov / .adirmcCalcCov) and the
+  # adirmc multi-study path -- all previously only covered for admc at the
+  # pipeline level. workers = 1L keeps restarts sequential (no PSOCK) so the
+  # tests stay fast and platform-independent.
+
+  # adgh: analytical-gradient covariance (.adghCalcCov gradient-Hessian path)
+  fit_adgh_cov <- run("adgh",
+    adghControl(studies = list(s1 = study1), n_nodes = 5L, maxeval = 15L,
+                seed = 1L, grad = "analytical", covMethod = "r"))
+
+  # adgh: multi-restart (.adghRestartWorker)
+  fit_adgh_restart <- run("adgh",
+    adghControl(studies = list(s1 = study1), n_nodes = 5L, maxeval = 12L,
+                seed = 1L, grad = "none", covMethod = "none",
+                n_restarts = 2L, workers = 1L, restart_sd = 0.2))
+
+  # adfo: multi-restart (.adfoRestartWorker)
+  fit_adfo_restart <- run("adfo",
+    adfoControl(studies = list(s1 = study1), maxeval = 12L,
+                grad = "none", covMethod = "none",
+                n_restarts = 2L, workers = 1L, restart_sd = 0.2))
+
+  # adfo: in-pipeline covariance (.adfoCalcCov)
+  fit_adfo_cov <- run("adfo",
+    adfoControl(studies = list(s1 = study1), maxeval = 15L,
+                grad = "none", covMethod = "r"))
+
+  # adirmc: multi-restart (.adirmcRestartWorker)
+  fit_adirmc_restart <- run("adirmc",
+    adirmcControl(studies = list(s1 = study1), n_sim = 300L,
+                  phases = c(1, 0.5), outer_iter = 8L, seed = 1L,
+                  covMethod = "none", n_restarts = 2L, workers = 1L,
+                  restart_sd = 0.2))
+
+  # adirmc: in-pipeline covariance (.adirmcCalcCov)
+  fit_adirmc_cov <- run("adirmc",
+    adirmcControl(studies = list(s1 = study1), n_sim = 300L,
+                  phases = c(1, 0.5), outer_iter = 8L, seed = 1L,
+                  covMethod = "r"))
+
+  # adirmc: multi-study
+  fit_adirmc_multistudy <- run("adirmc",
+    adirmcControl(studies = list(s1 = study1, s2 = study2), n_sim = 300L,
+                  phases = c(1, 0.5), outer_iter = 8L, seed = 1L,
+                  covMethod = "none"))
+
+  .int_pipeline_cache <<- list(
+    fit_admc              = fit_admc,
+    fit_adfo              = fit_adfo,
+    fit_adirmc            = fit_adirmc,
+    fit_adgh              = fit_adgh,
+    fit_restart           = fit_restart,
+    fit_multistudy        = fit_multistudy,
+    fit_cov               = fit_cov,
+    fit_adgh_cov          = fit_adgh_cov,
+    fit_adgh_restart      = fit_adgh_restart,
+    fit_adfo_restart      = fit_adfo_restart,
+    fit_adfo_cov          = fit_adfo_cov,
+    fit_adirmc_restart    = fit_adirmc_restart,
+    fit_adirmc_cov        = fit_adirmc_cov,
+    fit_adirmc_multistudy = fit_adirmc_multistudy,
+    tcl_true       = log(5),
+    tv_true        = log(20)
+  )
+  .int_pipeline_cache
 }

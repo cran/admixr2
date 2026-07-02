@@ -1,3 +1,59 @@
+test_that(".admNloptrAlgorithms: returns common NLopt names", {
+  algs <- admixr2:::.admNloptrAlgorithms()
+  expect_type(algs, "character")
+  expect_true(all(c("NLOPT_LN_BOBYQA", "NLOPT_LD_LBFGS", "NLOPT_LD_MMA") %in% algs))
+})
+
+test_that(".admAlgoNeedsGrad: classifies LD/GD as gradient-based", {
+  expect_true(admixr2:::.admAlgoNeedsGrad("NLOPT_LD_MMA"))
+  expect_true(admixr2:::.admAlgoNeedsGrad("NLOPT_GD_STOGO"))
+  expect_false(admixr2:::.admAlgoNeedsGrad("NLOPT_LN_BOBYQA"))
+  expect_false(admixr2:::.admAlgoNeedsGrad("NLOPT_GN_DIRECT"))
+})
+
+test_that(".admDefaultAlgorithm: LBFGS with gradient, BOBYQA when gradless", {
+  expect_equal(admixr2:::.admDefaultAlgorithm("none"),       "NLOPT_LN_BOBYQA")
+  expect_equal(admixr2:::.admDefaultAlgorithm("sens"),       "NLOPT_LD_LBFGS")
+  expect_equal(admixr2:::.admDefaultAlgorithm("analytical"), "NLOPT_LD_LBFGS")
+})
+
+test_that(".admResolveAlgorithm: NULL picks default matching grad (no message)", {
+  expect_silent(r1 <- admixr2:::.admResolveAlgorithm(NULL, "none"))
+  expect_equal(r1$algorithm, "NLOPT_LN_BOBYQA")
+  expect_equal(r1$grad, "none")
+  expect_silent(r2 <- admixr2:::.admResolveAlgorithm(NULL, "sens"))
+  expect_equal(r2$algorithm, "NLOPT_LD_LBFGS")
+  expect_equal(r2$grad, "sens")
+})
+
+test_that(".admResolveAlgorithm: any gradient algorithm + gradless -> BOBYQA", {
+  for (a in c("NLOPT_LD_LBFGS", "NLOPT_LD_MMA", "NLOPT_GD_STOGO")) {
+    res <- suppressMessages(admixr2:::.admResolveAlgorithm(a, "none"))
+    expect_equal(res$algorithm, "NLOPT_LN_BOBYQA")
+    expect_equal(res$grad, "none")
+  }
+  expect_message(admixr2:::.admResolveAlgorithm("NLOPT_LD_MMA", "none"),
+                 regexp = "grad = 'none'")
+})
+
+test_that(".admResolveAlgorithm: gradient algorithm kept with a gradient method", {
+  res <- admixr2:::.admResolveAlgorithm("NLOPT_LD_MMA", "fd")
+  expect_equal(res$algorithm, "NLOPT_LD_MMA")
+  expect_equal(res$grad, "fd")
+})
+
+test_that(".admResolveAlgorithm: derivative-free algorithm disables the gradient", {
+  res <- suppressMessages(
+    admixr2:::.admResolveAlgorithm("NLOPT_LN_SBPLX", "fd"))
+  expect_equal(res$algorithm, "NLOPT_LN_SBPLX")
+  expect_equal(res$grad, "none")
+})
+
+test_that(".admResolveAlgorithm: invalid algorithm errors", {
+  expect_error(admixr2:::.admResolveAlgorithm("NOPE", "none"),
+               regexp = "not a valid nloptr algorithm")
+})
+
 test_that(".admCalcObjStats: AIC = objective + 2*npar", {
   s <- make_study_var(n_times = 3L, n = 100L)
   res <- admixr2:::.admCalcObjStats(objective = 50.0, npar = 5L, studies = list(s1 = s))
@@ -37,6 +93,13 @@ test_that(".admMakeZ: sobol returns correct shape", {
   expect_length(z_list, 2L)
   expect_equal(dim(z_list[[1]]), c(500L, 2L))
   expect_equal(dim(z_list[[2]]), c(500L, 2L))
+})
+
+test_that(".admMakeZ: sobol with n_eta=1 returns matrix", {
+  pinfo <- admixr2:::.admParseIniDf(make_inidf_1eta())
+  z_list <- admixr2:::.admMakeZ(200L, pinfo, n_studies = 1L, sampling = "sobol")
+  expect_true(is.matrix(z_list[[1]]))
+  expect_equal(dim(z_list[[1]]), c(200L, 1L))
 })
 
 test_that(".admMakeZ: rnorm returns roughly N(0,1) marginals", {
@@ -179,4 +242,102 @@ test_that(".admFullTheta: off-diagonal omega entry from omega[neta1, neta2]", {
   i <- pinfo$iniDf$neta1[off_row]
   j <- pinfo$iniDf$neta2[off_row]
   expect_equal(unname(ft[off_nm]), pars$omega[i, j], tolerance = 1e-12)
+})
+
+# ---- .admMakeZ: additional sampling methods ----------------------------------
+
+test_that(".admMakeZ: halton returns correct shape", {
+  pinfo <- admixr2:::.admParseIniDf(make_inidf_2eta())
+  z_list <- admixr2:::.admMakeZ(200L, pinfo, n_studies = 1L, sampling = "halton")
+  expect_length(z_list, 1L)
+  expect_equal(dim(z_list[[1]]), c(200L, 2L))
+})
+
+test_that(".admMakeZ: halton with n_eta=1 returns matrix", {
+  pinfo <- admixr2:::.admParseIniDf(make_inidf_1eta())
+  z_list <- admixr2:::.admMakeZ(200L, pinfo, n_studies = 1L, sampling = "halton")
+  expect_true(is.matrix(z_list[[1]]))
+  expect_equal(dim(z_list[[1]]), c(200L, 1L))
+})
+
+test_that(".admMakeZ: torus returns correct shape", {
+  pinfo <- admixr2:::.admParseIniDf(make_inidf_2eta())
+  z_list <- admixr2:::.admMakeZ(200L, pinfo, n_studies = 1L, sampling = "torus")
+  expect_length(z_list, 1L)
+  expect_equal(dim(z_list[[1]]), c(200L, 2L))
+})
+
+test_that(".admMakeZ: torus with n_eta=1 returns matrix", {
+  pinfo <- admixr2:::.admParseIniDf(make_inidf_1eta())
+  z_list <- admixr2:::.admMakeZ(200L, pinfo, n_studies = 1L, sampling = "torus")
+  expect_true(is.matrix(z_list[[1]]))
+  expect_equal(dim(z_list[[1]]), c(200L, 1L))
+})
+
+test_that(".admMakeZ: lhs returns correct shape and uniform marginals", {
+  pinfo <- admixr2:::.admParseIniDf(make_inidf_1eta())
+  set.seed(99)
+  z_list <- admixr2:::.admMakeZ(100L, pinfo, n_studies = 1L, sampling = "lhs")
+  expect_equal(dim(z_list[[1]]), c(100L, 1L))
+})
+
+test_that(".admMakeZ: halton multi-study returns correct number of studies", {
+  # Use 2-eta model: randtoolbox::halton(dim=1) returns a vector not a matrix,
+  # so dim() is NULL for 1-eta; 2-eta always returns a matrix.
+  pinfo <- admixr2:::.admParseIniDf(make_inidf_2eta())
+  z_list <- admixr2:::.admMakeZ(50L, pinfo, n_studies = 3L, sampling = "halton")
+  expect_length(z_list, 3L)
+  for (i in seq_len(3L)) expect_equal(dim(z_list[[i]]), c(50L, 2L))
+})
+
+# ---- admData() ---------------------------------------------------------------
+
+test_that("admData() returns data.frame with required columns", {
+  d <- admData()
+  expect_s3_class(d, "data.frame")
+  expect_named(d, c("ID", "TIME", "DV", "AMT", "EVID", "CMT"))
+})
+
+test_that("admData() has all-NA DV column", {
+  d <- admData()
+  expect_true(all(is.na(d$DV)))
+})
+
+test_that("admData() has at least one dosing and one observation row", {
+  d <- admData()
+  expect_true(any(d$EVID != 0L))
+  expect_true(any(d$EVID == 0L))
+})
+
+# ---- admStopWorkers() --------------------------------------------------------
+
+test_that("admStopWorkers(): returns invisibly when no cluster is running", {
+  expect_invisible(admStopWorkers())
+})
+
+test_that("admStopWorkers(): can be called twice without error", {
+  expect_no_error(admStopWorkers())
+  expect_no_error(admStopWorkers())
+})
+
+# ---- %||% operator -----------------------------------------------------------
+
+test_that("%||% returns left side when non-NULL", {
+  expect_equal(admixr2:::`%||%`("a", "b"), "a")
+})
+
+test_that("%||% returns right side when left is NULL", {
+  expect_equal(admixr2:::`%||%`(NULL, "fallback"), "fallback")
+})
+
+test_that("%||% works with numeric values", {
+  expect_equal(admixr2:::`%||%`(NULL, 42), 42)
+  expect_equal(admixr2:::`%||%`(0, 42), 0)
+})
+
+# ---- .admSetupParallelPlan() single-worker fast path -------------------------
+
+test_that(".admSetupParallelPlan: workers=1 returns invisibly without starting workers", {
+  ctl <- admControl(workers = 1L)
+  expect_invisible(admixr2:::.admSetupParallelPlan(ctl, n_r = 3L))
 })
